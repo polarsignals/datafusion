@@ -20,13 +20,14 @@ use ahash::RandomState;
 use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, ListArray, StructArray};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::proxy::{RawTableAllocExt, VecAllocExt};
 use datafusion_expr::EmitTo;
 use hashbrown::raw::RawTable;
+use std::sync::Arc;
 
 /// A [`GroupValues`] making use of [`Rows`]
 pub struct GroupValuesRows {
@@ -230,6 +231,12 @@ impl GroupValues for GroupValuesRows {
                 }
                 *array = cast(array.as_ref(), expected)?;
             }
+
+            if expected.is_nested()
+                && needs_nested_dictionary_encoding(expected, array)?
+            {
+                *array = dictionary_encode_nested(array.clone(), expected)?;
+            }
         }
 
         self.group_values = Some(group_values);
@@ -247,5 +254,95 @@ impl GroupValues for GroupValuesRows {
         self.map_size = self.map.capacity() * std::mem::size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(count);
+    }
+}
+
+fn needs_nested_dictionary_encoding(
+    expected: &DataType,
+    actual: &ArrayRef,
+) -> Result<bool> {
+    match (expected, actual.data_type()) {
+        (
+            &DataType::Struct(ref expected_fields),
+            &DataType::Struct(ref actual_fields),
+        ) => {
+            if expected_fields.len() != actual_fields.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "Converted group rows expected struct of {} fields got {}",
+                    expected_fields.len(),
+                    actual_fields.len(),
+                )));
+            }
+
+            let actual_struct = actual.as_any().downcast_ref::<StructArray>().unwrap();
+            Ok(expected_fields
+                .iter()
+                .zip(actual_struct.columns().iter())
+                .map(|(expected_field, actual_column)| {
+                    // Propagate the result of needs_nested_dictionary_encoding
+                    needs_nested_dictionary_encoding(
+                        expected_field.data_type(),
+                        actual_column,
+                    )
+                })
+                .try_fold(false, |acc, needs_nested| {
+                    Ok::<bool, DataFusionError>(acc || needs_nested?)
+                })?)
+        }
+        (&DataType::List(ref expected_field), &DataType::List(_)) => {
+            let actual_list = actual.as_any().downcast_ref::<ListArray>().unwrap();
+            needs_nested_dictionary_encoding(
+                expected_field.data_type(),
+                actual_list.values(),
+            )
+        }
+        (&DataType::Dictionary(_, ref value), _) => {
+            let actual_data_type = actual.data_type();
+            let value_data_type = value.as_ref();
+            if value_data_type != actual_data_type {
+                return Err(DataFusionError::Internal(format!(
+                            "Converted group rows expected dictionary of {value_data_type} got {actual_data_type}"
+                )));
+            }
+
+            Ok(true)
+        }
+        (_, _) => Ok(false),
+    }
+}
+
+fn dictionary_encode_nested(array: ArrayRef, expected: &DataType) -> Result<ArrayRef> {
+    match (expected, array.data_type()) {
+        (&DataType::Struct(ref expected_fields), _) => {
+            let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let arrays = expected_fields
+                .iter()
+                .zip(struct_array.columns())
+                .map(|(expected_field, column)| {
+                    dictionary_encode_nested(column.clone(), expected_field.data_type())
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(Arc::new(StructArray::try_new(
+                expected_fields.clone(),
+                arrays,
+                struct_array.nulls().cloned(),
+            )?))
+        }
+        (&DataType::List(ref expected_field), &DataType::List(_)) => {
+            let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+
+            Ok(Arc::new(ListArray::try_new(
+                expected_field.clone(),
+                list.offsets().clone(),
+                dictionary_encode_nested(
+                    list.values().clone(),
+                    expected_field.data_type(),
+                )?,
+                list.nulls().cloned(),
+            )?))
+        }
+        (&DataType::Dictionary(_, _), _) => Ok(cast(array.as_ref(), expected)?),
+        (_, _) => Ok(array.clone()),
     }
 }
