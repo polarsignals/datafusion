@@ -185,6 +185,25 @@ incremental = false
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
 large_futures = "warn"
 
+[patch.crates-io]
+# Until https://github.com/apache/arrow-rs/pull/7131 is merged and released.
+arrow = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-arith = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-array = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-buffer = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-cast = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-csv = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-data = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-flight = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-ipc = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-json = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-ord = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-row = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-schema = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-select = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+arrow-string = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+parquet = { git = "https://github.com/polarsignals/arrow-rs.git", branch = "master" }
+
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
 unused_qualifications = "deny"
