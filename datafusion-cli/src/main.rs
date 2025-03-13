@@ -29,7 +29,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_cli::catalog::DynamicObjectStoreCatalog;
 use datafusion_cli::functions::ParquetMetadataFunc;
 use datafusion_cli::{
-    exec,
+    debuginfo, exec,
     pool_type::PoolType,
     print_format::PrintFormat,
     print_options::{MaxRows, PrintOptions},
@@ -37,6 +37,9 @@ use datafusion_cli::{
 };
 
 use clap::Parser;
+use datafusion::catalog::CatalogProviderList;
+use datafusion::execution::SessionStateBuilder;
+use datafusion_cli::symbolize::{SymbolizeOptimizerRule, SymbolizeQueryPlanner};
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -170,14 +173,27 @@ async fn main_inner() -> Result<()> {
     let runtime_env = rt_builder.build_arc()?;
 
     // enable dynamic file query
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env)
-        .enable_url_table();
+    let state = SessionStateBuilder::new()
+        .with_config(session_config)
+        .with_runtime_env(runtime_env)
+        .with_default_features()
+        .with_query_planner(Arc::new(SymbolizeQueryPlanner {}))
+        .with_optimizer_rule(Arc::new(SymbolizeOptimizerRule {}))
+        .build();
+    let ctx = SessionContext::new_with_state(state).enable_url_table();
     ctx.refresh_catalogs().await?;
     // install dynamic catalog provider that can register required object stores
-    ctx.register_catalog_list(Arc::new(DynamicObjectStoreCatalog::new(
+    println!("catalog list {:?}", ctx.state().catalog_list());
+    let dynamic_catalog = Arc::new(DynamicObjectStoreCatalog::new(
         ctx.state().catalog_list().clone(),
         ctx.state_weak_ref(),
-    )));
+    ));
+    dynamic_catalog.register_catalog(
+        "debuginfo".to_string(),
+        Arc::new(debuginfo::CatalogProvider {}),
+    );
+    println!("dynamic catalog list {:?}", dynamic_catalog.catalog_names());
+    ctx.register_catalog_list(dynamic_catalog);
     // register `parquet_metadata` table function to get metadata from parquet files
     ctx.register_udtf("parquet_metadata", Arc::new(ParquetMetadataFunc {}));
 
