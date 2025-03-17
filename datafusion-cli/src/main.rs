@@ -39,7 +39,10 @@ use datafusion_cli::{
 use clap::Parser;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::execution::SessionStateBuilder;
-use datafusion_cli::symbolize::{SymbolizeOptimizerRule, SymbolizeQueryPlanner};
+use datafusion_cli::symbolize::logical::{
+    SymbolizeMarkerOptimizerRule, SymbolizeQueryPlanner,
+};
+use datafusion_cli::symbolize::udf::register_symbolize_udf;
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -178,12 +181,12 @@ async fn main_inner() -> Result<()> {
         .with_runtime_env(runtime_env)
         .with_default_features()
         .with_query_planner(Arc::new(SymbolizeQueryPlanner {}))
-        .with_optimizer_rule(Arc::new(SymbolizeOptimizerRule {}))
+        .with_optimizer_rule(Arc::new(SymbolizeMarkerOptimizerRule {}))
         .build();
     let ctx = SessionContext::new_with_state(state).enable_url_table();
     ctx.refresh_catalogs().await?;
+    register_symbolize_udf(&ctx);
     // install dynamic catalog provider that can register required object stores
-    println!("catalog list {:?}", ctx.state().catalog_list());
     let dynamic_catalog = Arc::new(DynamicObjectStoreCatalog::new(
         ctx.state().catalog_list().clone(),
         ctx.state_weak_ref(),
