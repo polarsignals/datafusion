@@ -81,33 +81,38 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int32Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use async_trait::async_trait;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchemaRef, Result};
-use datafusion::execution::context::{QueryPlanner, SessionState};
+use datafusion::common::{DFSchemaRef, Result, ScalarValue};
+use datafusion::execution::context::{QueryPlanner, SessionState, TaskContext};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{
     Aggregate, Expr, Extension, LogicalPlan, ScalarUDF, ScalarUDFImpl, Signature,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility,
 };
 use datafusion::optimizer::AnalyzerRule;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{ColumnarValue, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    ColumnarValue, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, SendableRecordBatchStream,
+};
 use datafusion::physical_planner::{
     create_aggregate_expr_and_maybe_filter, DefaultPhysicalPlanner, ExtensionPlanner,
     PhysicalPlanner,
 };
 use datafusion::prelude::*;
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::logical_expr::ScalarFunctionArgs;
 
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 
 // ============================================================================
 // 1. Marker UDF: partial_agg()
@@ -356,16 +361,328 @@ impl AnalyzerRule for PartialAggregateRule {
 }
 
 // ============================================================================
-// 4. Extension Planner: PartialOnlyAggregatePlanner
+// 4. Custom ExecutionPlan: StreamingPartialAggExec
+// ============================================================================
+
+/// A custom physical operator that performs hash aggregation with periodic
+/// flushing of partial results every `emit_every` input batches.
+///
+/// Unlike DataFusion's built-in `AggregateExec(Partial)` which buffers all
+/// groups before emitting, this operator guarantees that partial results
+/// flow to the client at a predictable cadence.
+///
+/// Uses DataFusion's `Accumulator` trait (public API) for the actual
+/// aggregation logic — no reimplementation of SUM/COUNT/etc.
+#[derive(Debug)]
+struct StreamingPartialAggExec {
+    input: Arc<dyn ExecutionPlan>,
+    /// Physical expressions for GROUP BY columns
+    group_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+    /// Names for GROUP BY columns in the output
+    group_names: Vec<String>,
+    /// Aggregate function expressions (used to create Accumulators)
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+    /// Flush partial state every N input batches
+    emit_every: usize,
+    /// Output schema: group columns + aggregate result columns
+    schema: SchemaRef,
+    cache: PlanProperties,
+}
+
+impl StreamingPartialAggExec {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        group_exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>,
+        group_names: Vec<String>,
+        aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+        emit_every: usize,
+        schema: SchemaRef,
+    ) -> Self {
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            input.output_partitioning().clone(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            input,
+            group_exprs,
+            group_names,
+            aggr_exprs,
+            emit_every,
+            schema,
+            cache,
+        }
+    }
+
+    /// Create fresh accumulators for a new group.
+    fn create_accumulators(
+        aggr_exprs: &[Arc<AggregateFunctionExpr>],
+    ) -> Result<Vec<Box<dyn datafusion::logical_expr::Accumulator>>> {
+        aggr_exprs.iter().map(|e| e.create_accumulator()).collect()
+    }
+
+    /// Flush all accumulated state into a RecordBatch, then clear.
+    fn flush(
+        groups: &mut HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion::logical_expr::Accumulator>>>,
+        group_names: &[String],
+        aggr_exprs: &[Arc<AggregateFunctionExpr>],
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch> {
+        let num_groups = groups.len();
+        if num_groups == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(schema)));
+        }
+
+        let num_group_cols = group_names.len();
+        let num_agg_cols = aggr_exprs.len();
+
+        // Collect one ScalarValue per (group, column).
+        let mut group_values: Vec<Vec<ScalarValue>> =
+            (0..num_group_cols).map(|_| Vec::with_capacity(num_groups)).collect();
+        let mut agg_values: Vec<Vec<ScalarValue>> =
+            (0..num_agg_cols).map(|_| Vec::with_capacity(num_groups)).collect();
+
+        for (key, mut accumulators) in groups.drain() {
+            for (col_idx, val) in key.into_iter().enumerate() {
+                group_values[col_idx].push(val);
+            }
+            for (col_idx, acc) in accumulators.iter_mut().enumerate() {
+                agg_values[col_idx].push(acc.evaluate()?);
+            }
+        }
+
+        // Convert Vec<ScalarValue> → ArrayRef for each column.
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + num_agg_cols);
+        for vals in group_values {
+            columns.push(ScalarValue::iter_to_array(vals)?);
+        }
+        for vals in agg_values {
+            columns.push(ScalarValue::iter_to_array(vals)?);
+        }
+
+        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+    }
+}
+
+impl DisplayAs for StreamingPartialAggExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "StreamingPartialAggExec: emit_every={}, group_by=[{}], aggr=[{}]",
+            self.emit_every,
+            self.group_names.join(", "),
+            self.aggr_exprs
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
+impl ExecutionPlan for StreamingPartialAggExec {
+    fn name(&self) -> &'static str {
+        "StreamingPartialAggExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            children[0].clone(),
+            self.group_exprs.clone(),
+            self.group_names.clone(),
+            self.aggr_exprs.clone(),
+            self.emit_every,
+            Arc::clone(&self.schema),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let group_exprs = self.group_exprs.clone();
+        let group_names = self.group_names.clone();
+        let aggr_exprs = self.aggr_exprs.clone();
+        let emit_every = self.emit_every;
+        let schema = Arc::clone(&self.schema);
+        let schema2 = Arc::clone(&self.schema);
+
+        type Groups = HashMap<
+            Vec<ScalarValue>,
+            Vec<Box<dyn datafusion::logical_expr::Accumulator>>,
+        >;
+
+        let output_stream = stream::unfold(
+            (input_stream, Groups::new(), 0usize, false),
+            move |(mut input, mut groups, mut batch_count, done)| {
+                let group_exprs = group_exprs.clone();
+                let group_names = group_names.clone();
+                let aggr_exprs = aggr_exprs.clone();
+                let schema = Arc::clone(&schema);
+                async move {
+                    if done {
+                        return None;
+                    }
+                    loop {
+                        match input.next().await {
+                            Some(Ok(batch)) => {
+                                // Evaluate group-by expressions.
+                                let group_cols: Vec<ArrayRef> = group_exprs
+                                    .iter()
+                                    .map(|expr| {
+                                        expr.evaluate(&batch)
+                                            .and_then(|cv| cv.into_array(batch.num_rows()))
+                                    })
+                                    .collect::<Result<Vec<_>>>()
+                                    .ok()?;
+
+                                // Evaluate aggregate input expressions.
+                                let agg_input_cols: Vec<Vec<ArrayRef>> = aggr_exprs
+                                    .iter()
+                                    .map(|agg_expr| {
+                                        agg_expr
+                                            .expressions()
+                                            .iter()
+                                            .map(|expr| {
+                                                expr.evaluate(&batch).and_then(|cv| {
+                                                    cv.into_array(batch.num_rows())
+                                                })
+                                            })
+                                            .collect::<Result<Vec<_>>>()
+                                    })
+                                    .collect::<Result<Vec<_>>>()
+                                    .ok()?;
+
+                                // Group rows by key and update accumulators.
+                                // Build per-group row index lists.
+                                let mut group_row_indices: HashMap<Vec<ScalarValue>, Vec<u32>> =
+                                    HashMap::new();
+
+                                for row in 0..batch.num_rows() {
+                                    let key: Vec<ScalarValue> = group_cols
+                                        .iter()
+                                        .map(|col| ScalarValue::try_from_array(col, row))
+                                        .collect::<Result<Vec<_>>>()
+                                        .ok()?;
+                                    group_row_indices
+                                        .entry(key)
+                                        .or_default()
+                                        .push(row as u32);
+                                }
+
+                                // For each group, extract sub-arrays and update accumulators.
+                                for (key, indices) in &group_row_indices {
+                                    let accumulators = groups
+                                        .entry(key.clone())
+                                        .or_insert_with(|| {
+                                            Self::create_accumulators(&aggr_exprs).unwrap()
+                                        });
+
+                                    let idx_array = arrow::array::UInt32Array::from(
+                                        indices.clone(),
+                                    );
+                                    for (acc, inputs) in
+                                        accumulators.iter_mut().zip(&agg_input_cols)
+                                    {
+                                        let filtered: Vec<ArrayRef> = inputs
+                                            .iter()
+                                            .map(|col| {
+                                                arrow::compute::take(
+                                                    col.as_ref(),
+                                                    &idx_array,
+                                                    None,
+                                                )
+                                                .map(|a| a as ArrayRef)
+                                            })
+                                            .collect::<std::result::Result<Vec<_>, _>>()
+                                            .ok()?;
+                                        acc.update_batch(&filtered).ok()?;
+                                    }
+                                }
+
+                                batch_count += 1;
+                                if batch_count % emit_every == 0 && !groups.is_empty() {
+                                    let rb = Self::flush(
+                                        &mut groups,
+                                        &group_names,
+                                        &aggr_exprs,
+                                        &schema,
+                                    )
+                                    .ok()?;
+                                    return Some((
+                                        Ok(rb),
+                                        (input, groups, batch_count, false),
+                                    ));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                return Some((
+                                    Err(e),
+                                    (input, groups, batch_count, true),
+                                ));
+                            }
+                            None => {
+                                // Input exhausted — flush remaining.
+                                if !groups.is_empty() {
+                                    let rb = Self::flush(
+                                        &mut groups,
+                                        &group_names,
+                                        &aggr_exprs,
+                                        &schema,
+                                    )
+                                    .ok()?;
+                                    return Some((
+                                        Ok(rb),
+                                        (input, groups, batch_count, true),
+                                    ));
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema2,
+            output_stream,
+        )))
+    }
+}
+
+// ============================================================================
+// 4b. Extension Planner: PartialOnlyAggregatePlanner
 // ============================================================================
 
 /// Physical planner for `PartialOnlyAggregate` nodes.
 ///
-/// Creates a single `AggregateExec` in `Partial` mode — no Final stage.
-/// The output schema matches the intermediate state format of each
-/// aggregate function.
+/// Creates a `StreamingPartialAggExec` that flushes partial results
+/// every N input batches. The output schema matches the logical
+/// aggregate schema directly.
 #[derive(Debug)]
 struct PartialOnlyAggregatePlanner;
+
+/// How many input batches to process before flushing partial state.
+const DEFAULT_EMIT_EVERY: usize = 4;
 
 #[async_trait]
 impl ExtensionPlanner for PartialOnlyAggregatePlanner {
@@ -386,24 +703,17 @@ impl ExtensionPlanner for PartialOnlyAggregatePlanner {
         let logical_input_schema = partial_node.input.schema();
         let physical_input_schema = input_exec.schema();
 
-        // Build PhysicalGroupBy from group expressions.
-        let groups = PhysicalGroupBy::new_single(
-            partial_node
-                .group_expr
-                .iter()
-                .map(|e| {
-                    let phys = planner.create_physical_expr(
-                        e,
-                        logical_input_schema,
-                        session_state,
-                    )?;
-                    let name = e.schema_name().to_string();
-                    Ok((phys, name))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        );
+        // Build physical group-by expressions.
+        let mut group_phys_exprs = Vec::new();
+        let mut group_names = Vec::new();
+        for e in &partial_node.group_expr {
+            let phys =
+                planner.create_physical_expr(e, logical_input_schema, session_state)?;
+            group_phys_exprs.push(phys);
+            group_names.push(e.schema_name().to_string());
+        }
 
-        // Build aggregate expressions.
+        // Build physical aggregate function expressions.
         let agg_filter: Vec<_> = partial_node
             .aggr_expr
             .iter()
@@ -417,46 +727,22 @@ impl ExtensionPlanner for PartialOnlyAggregatePlanner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut aggregates = Vec::with_capacity(agg_filter.len());
-        let mut filters = Vec::with_capacity(agg_filter.len());
-        for (agg, filter, _order_by) in agg_filter {
-            aggregates.push(agg);
-            filters.push(filter);
-        }
+        let aggr_exprs: Vec<Arc<AggregateFunctionExpr>> =
+            agg_filter.into_iter().map(|(agg, _filter, _order)| agg).collect();
 
-        // Create ONLY the Partial aggregate — no Final stage.
-        let partial_agg = Arc::new(AggregateExec::try_new(
-            AggregateMode::Partial,
-            groups,
-            aggregates,
-            filters,
-            input_exec,
-            physical_input_schema,
-        )?);
-
-        // AggregateExec(Partial) outputs intermediate state columns with
-        // different names than the logical schema (e.g., "metrics.bucket"
-        // and "sum(value)[sum]" instead of "bucket" and "sum(value)").
-        // Add a ProjectionExec to rename columns to match the logical schema.
-        let partial_schema = partial_agg.schema();
+        // Build output schema: group columns + aggregate result columns.
         let logical_schema: &DFSchemaRef =
             UserDefinedLogicalNodeCore::schema(partial_node);
-        let projection_exprs: Vec<(Arc<dyn datafusion::physical_plan::PhysicalExpr>, String)> =
-            (0..partial_schema.fields().len())
-                .map(|i| {
-                    let col: Arc<dyn datafusion::physical_plan::PhysicalExpr> = Arc::new(
-                        datafusion::physical_plan::expressions::Column::new(
-                            partial_schema.field(i).name(),
-                            i,
-                        ),
-                    );
-                    let logical_name = logical_schema.field(i).name().clone();
-                    (col, logical_name)
-                })
-                .collect();
+        let output_schema: SchemaRef = Arc::new(logical_schema.as_arrow().clone());
 
-        let projection = ProjectionExec::try_new(projection_exprs, partial_agg)?;
-        Ok(Some(Arc::new(projection)))
+        Ok(Some(Arc::new(StreamingPartialAggExec::new(
+            input_exec,
+            group_phys_exprs,
+            group_names,
+            aggr_exprs,
+            DEFAULT_EMIT_EVERY,
+            output_schema,
+        ))))
     }
 }
 
@@ -605,13 +891,13 @@ async fn main() -> Result<()> {
         datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
     );
 
-    // Verify the plan has only Partial mode (no Final/FinalPartitioned aggregate).
-    assert_no_final_aggregate(&plan);
-
-    // The inner AggregateExec(Partial) has Incremental emission.
-    // The outer ProjectionExec (for column renaming) may report Final,
-    // but the streaming behavior is preserved.
-    println!("Top-level emission type: {:?}", plan.properties().emission_type);
+    // Verify the plan uses our custom streaming exec (no AggregateExec at all).
+    assert_no_aggregate_exec(&plan);
+    assert_eq!(
+        plan.properties().emission_type,
+        EmissionType::Incremental,
+        "StreamingPartialAggExec should report Incremental emission"
+    );
 
     // Execute and merge partial results client-side.
     let mut merged_sum: HashMap<String, f64> = HashMap::new();
@@ -765,19 +1051,16 @@ async fn main() -> Result<()> {
 // Helpers
 // ============================================================================
 
-/// Walk the physical plan tree and assert there is no Final/FinalPartitioned
-/// AggregateExec. The plan should contain only Partial mode aggregates.
-fn assert_no_final_aggregate(plan: &Arc<dyn ExecutionPlan>) {
-    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
-        assert_eq!(
-            agg.mode(),
-            &AggregateMode::Partial,
-            "Expected only Partial aggregate, found {:?}",
-            agg.mode()
-        );
-    }
+/// Walk the physical plan tree and assert there is no AggregateExec.
+/// The plan should use only our custom StreamingPartialAggExec.
+fn assert_no_aggregate_exec(plan: &Arc<dyn ExecutionPlan>) {
+    use datafusion::physical_plan::aggregates::AggregateExec;
+    assert!(
+        plan.as_any().downcast_ref::<AggregateExec>().is_none(),
+        "Found unexpected AggregateExec in plan; expected StreamingPartialAggExec"
+    );
     for child in plan.children() {
-        assert_no_final_aggregate(child);
+        assert_no_aggregate_exec(child);
     }
 }
 

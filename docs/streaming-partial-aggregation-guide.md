@@ -290,50 +290,75 @@ ProjectionExec: expr=[metrics.bucket@0 as bucket,
 
 No `Final`/`FinalPartitioned` stage. The `ProjectionExec` handles the column name mapping between the Partial aggregate's intermediate output and the logical schema.
 
-## Emission Behavior and Controlling Flush Frequency
+## Emission Behavior: StreamingPartialAggExec
 
-### What the Marker UDF Gives You
+The reference implementation uses a custom `StreamingPartialAggExec` operator that replaces DataFusion's built-in `AggregateExec(Partial)`. It flushes accumulated state every N input batches, giving predictable streaming behavior.
 
-The marker UDF approach removes the Final stage so partial results flow directly to the client. However, `AggregateExec(Partial)` is still DataFusion's built-in hash aggregate. Its emission behavior is:
+### Why Not Use AggregateExec(Partial)?
 
-- **Default**: It accumulates all input batches into a hash table, then emits one output batch per input partition at the end. This is technically "partial" (the state format is intermediate), but it's not truly streaming — the client still waits for all input to be consumed.
-- **Under memory pressure**: DataFusion's `emit_early_if_necessary` (in `row_hash.rs`) spills partial state when the memory pool is exhausted. This produces multiple partial batches for the same group keys, but it's a side effect of memory management, not a deliberate emission strategy.
+DataFusion's built-in `AggregateExec(Partial)` buffers all groups before emitting a single batch at the end. It only emits early as a side effect of memory pressure (`emit_early_if_necessary` in `row_hash.rs`), which is imprecise and data-dependent. There are no knobs for "emit every N batches." A custom operator is needed for controlled emission.
 
-In other words: removing the Final stage is necessary but not sufficient for true streaming. The built-in `AggregateExec(Partial)` doesn't have knobs for "emit every N batches" or "emit every T seconds."
-
-### Approaches for Controlled Emission
-
-For production use, you'll likely want one of these:
-
-**Option A: Custom ExecutionPlan operator.** Replace `AggregateExec(Partial)` in the `ExtensionPlanner` with a custom `ExecutionPlan` that wraps the input scan and implements its own hash aggregation with explicit flush triggers:
+### How StreamingPartialAggExec Works
 
 ```rust
-struct StreamingPartialAggregateExec {
+struct StreamingPartialAggExec {
     input: Arc<dyn ExecutionPlan>,
-    group_exprs: Vec<Arc<dyn PhysicalExpr>>,
-    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
-    /// Flush partial state every N input batches
-    emit_every_n_batches: usize,
-    /// Or flush when this duration has elapsed since last flush
-    emit_interval: Option<Duration>,
+    group_exprs: Vec<Arc<dyn PhysicalExpr>>,     // GROUP BY columns
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,  // SUM, COUNT, etc.
+    emit_every: usize,                            // flush every N input batches
+    schema: SchemaRef,
 }
 ```
 
-The `execute()` method would consume input batches, accumulate into a hash table, and periodically flush (clear and emit) the accumulated state based on whichever trigger fires first. The reference example in `streaming_partial_aggregate.rs` demonstrates this pattern with a hardcoded `emit_every` batch count.
+Execution loop per partition:
 
-This gives you full control over emission but requires reimplementing the hash aggregation logic (or wrapping DataFusion's accumulators).
+1. **Evaluate** group-by expressions and aggregate input expressions on each input batch
+2. **Group rows by key** using `ScalarValue` vectors as hash keys
+3. **Update accumulators** per group using `Accumulator::update_batch()` with `arrow::compute::take()` to extract per-group sub-arrays
+4. **Every N batches**, call `Accumulator::evaluate()` on all groups, emit a `RecordBatch`, clear state
+5. **On input exhaustion**, flush remaining accumulated state
 
-**Option B: Memory pool tuning (pragmatic hack).** Keep the built-in `AggregateExec(Partial)` and configure a small `GreedyMemoryPool` to force frequent early emission:
+### Reusing DataFusion's Accumulator API
+
+The key insight: you don't need to reimplement SUM, COUNT, AVG, etc. DataFusion's `Accumulator` trait is public API:
 
 ```rust
-let runtime = RuntimeEnvBuilder::new()
-    .with_memory_pool(Arc::new(GreedyMemoryPool::new(300_000)))
-    .build_arc()?;
+// Create accumulators from the same AggregateFunctionExpr the planner produces
+let accumulator: Box<dyn Accumulator> = agg_expr.create_accumulator()?;
+
+// Feed it data (arrays, not row-by-row)
+accumulator.update_batch(&[values_array])?;
+
+// Extract the result
+let result: ScalarValue = accumulator.evaluate()?;
 ```
 
-This is simple but imprecise — emission frequency depends on data characteristics (number of distinct groups, row sizes) rather than explicit triggers. It's useful for prototyping but not recommended for production.
+What you **do** need to implement yourself:
+- **Group key hashing**: DataFusion's `GroupValues` is `pub(crate)` (internal). The reference implementation uses `HashMap<Vec<ScalarValue>, Vec<Box<dyn Accumulator>>>` — simple and correct, though not as fast as DataFusion's specialized hash tables.
+- **Row-to-group routing**: For each input row, extract group key values via `ScalarValue::try_from_array()`, look up the group in the hash map, then use `arrow::compute::take()` to build per-group sub-arrays for `update_batch()`.
 
-**Option C: Extend AggregateExec (upstream contribution).** Add batch-count or time-based emission triggers to DataFusion's `AggregateExec(Partial)` itself. This would be the cleanest long-term solution but requires changes to DataFusion core.
+### Choosing an Emission Trigger
+
+Batch count (`emit_every: usize`) is the right default:
+
+- **Deterministic and testable** — same input always produces same number of flushes
+- **Adapts to input rate** — faster data means more frequent flushes
+- **No async complexity** — no timers, no `tokio::time::interval`
+
+For time-based triggers, you'd add a `last_flush: Instant` field and check `last_flush.elapsed() > threshold` after each batch. This is straightforward to add but harder to test deterministically.
+
+### Resulting Physical Plan
+
+```
+ProjectionExec: expr=[bucket@0 as bucket,
+                      sum(metrics.value)@1 as total,
+                      count(*)@2 as cnt]
+  StreamingPartialAggExec: emit_every=4, group_by=[metrics.bucket],
+                           aggr=[sum(metrics.value), count(*)]
+    MemoryExec: partitions=2, partition_sizes=[20, 20]
+```
+
+The `StreamingPartialAggExec` outputs the final aggregate schema directly (not intermediate state), so the `ProjectionExec` above it only handles aliasing (`total`, `cnt`), not column format translation.
 
 ## Required Dependencies
 
