@@ -290,25 +290,50 @@ ProjectionExec: expr=[metrics.bucket@0 as bucket,
 
 No `Final`/`FinalPartitioned` stage. The `ProjectionExec` handles the column name mapping between the Partial aggregate's intermediate output and the logical schema.
 
-## Triggering Early Emission Under Memory Pressure
+## Emission Behavior and Controlling Flush Frequency
 
-The `AggregateExec(Partial)` operator already supports emitting partial results early when memory pressure is detected (see `emit_early_if_necessary` in `row_hash.rs`). To force frequent emission:
+### What the Marker UDF Gives You
 
-1. **Configure a small memory pool:**
-   ```rust
-   let runtime = RuntimeEnvBuilder::new()
-       .with_memory_pool(Arc::new(GreedyMemoryPool::new(300_000))) // 300 KB
-       .build_arc()?;
-   ```
+The marker UDF approach removes the Final stage so partial results flow directly to the client. However, `AggregateExec(Partial)` is still DataFusion's built-in hash aggregate. Its emission behavior is:
 
-2. **Use multiple partitions** (required — with 1 partition the optimizer picks `Single` mode which doesn't support early emission):
-   ```rust
-   let config = SessionConfig::new().with_target_partitions(2);
-   ```
+- **Default**: It accumulates all input batches into a hash table, then emits one output batch per input partition at the end. This is technically "partial" (the state format is intermediate), but it's not truly streaming — the client still waits for all input to be consumed.
+- **Under memory pressure**: DataFusion's `emit_early_if_necessary` (in `row_hash.rs`) spills partial state when the memory pool is exhausted. This produces multiple partial batches for the same group keys, but it's a side effect of memory management, not a deliberate emission strategy.
 
-3. **Use enough distinct groups** that the hash table grows large enough to trigger memory pressure.
+In other words: removing the Final stage is necessary but not sufficient for true streaming. The built-in `AggregateExec(Partial)` doesn't have knobs for "emit every N batches" or "emit every T seconds."
 
-Without memory pressure, the Partial aggregate may still buffer all groups before emitting a single batch. The memory pool is the mechanism for controlling emission frequency.
+### Approaches for Controlled Emission
+
+For production use, you'll likely want one of these:
+
+**Option A: Custom ExecutionPlan operator.** Replace `AggregateExec(Partial)` in the `ExtensionPlanner` with a custom `ExecutionPlan` that wraps the input scan and implements its own hash aggregation with explicit flush triggers:
+
+```rust
+struct StreamingPartialAggregateExec {
+    input: Arc<dyn ExecutionPlan>,
+    group_exprs: Vec<Arc<dyn PhysicalExpr>>,
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+    /// Flush partial state every N input batches
+    emit_every_n_batches: usize,
+    /// Or flush when this duration has elapsed since last flush
+    emit_interval: Option<Duration>,
+}
+```
+
+The `execute()` method would consume input batches, accumulate into a hash table, and periodically flush (clear and emit) the accumulated state based on whichever trigger fires first. The reference example in `streaming_partial_aggregate.rs` demonstrates this pattern with a hardcoded `emit_every` batch count.
+
+This gives you full control over emission but requires reimplementing the hash aggregation logic (or wrapping DataFusion's accumulators).
+
+**Option B: Memory pool tuning (pragmatic hack).** Keep the built-in `AggregateExec(Partial)` and configure a small `GreedyMemoryPool` to force frequent early emission:
+
+```rust
+let runtime = RuntimeEnvBuilder::new()
+    .with_memory_pool(Arc::new(GreedyMemoryPool::new(300_000)))
+    .build_arc()?;
+```
+
+This is simple but imprecise — emission frequency depends on data characteristics (number of distinct groups, row sizes) rather than explicit triggers. It's useful for prototyping but not recommended for production.
+
+**Option C: Extend AggregateExec (upstream contribution).** Add batch-count or time-based emission triggers to DataFusion's `AggregateExec(Partial)` itself. This would be the cleanest long-term solution but requires changes to DataFusion core.
 
 ## Required Dependencies
 
