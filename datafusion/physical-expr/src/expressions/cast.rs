@@ -26,7 +26,9 @@ use arrow::compute::{CastOptions, can_cast_types};
 use arrow::datatypes::{DataType, DataType::*, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
-use datafusion_common::nested_struct::validate_struct_compatibility;
+use datafusion_common::nested_struct::{
+    requires_nested_struct_cast, validate_data_type_compatibility,
+};
 use datafusion_common::{Result, not_impl_err};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
@@ -42,20 +44,14 @@ const DEFAULT_SAFE_CAST_OPTIONS: CastOptions<'static> = CastOptions {
     format_options: DEFAULT_FORMAT_OPTIONS,
 };
 
-/// Check if struct-to-struct casting is allowed by validating field compatibility.
+/// Check if name-based struct casting is allowed by validating field compatibility.
 ///
 /// This function applies the same validation rules as execution time to ensure
 /// planning-time validation matches runtime validation, enabling fail-fast behavior
-/// instead of deferring errors to execution.
-fn can_cast_struct_types(source: &DataType, target: &DataType) -> bool {
-    match (source, target) {
-        (Struct(source_fields), Struct(target_fields)) => {
-            // Apply the same struct compatibility rules as at execution time.
-            // This ensures planning-time validation matches execution-time validation.
-            validate_struct_compatibility(source_fields, target_fields).is_ok()
-        }
-        _ => false,
-    }
+/// instead of deferring errors to execution. Handles structs at any nesting level
+/// (e.g., `List<Struct>`, `Dictionary<_, Struct>`).
+fn can_cast_named_struct_types(source: &DataType, target: &DataType) -> bool {
+    validate_data_type_compatibility("", source, target).is_ok()
 }
 
 /// CAST expression casts an expression to a specific data type and returns a runtime error on invalid cast
@@ -252,13 +248,13 @@ pub fn cast_with_options(
     let expr_type = expr.data_type(input_schema)?;
     if expr_type == cast_type {
         Ok(Arc::clone(&expr))
+    } else if requires_nested_struct_cast(&expr_type, &cast_type) {
+        if can_cast_named_struct_types(&expr_type, &cast_type) {
+            Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
+        } else {
+            not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
+        }
     } else if can_cast_types(&expr_type, &cast_type) {
-        Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
-    } else if can_cast_struct_types(&expr_type, &cast_type) {
-        // Allow struct-to-struct casts that pass name-based compatibility validation.
-        // This validation is applied at planning time (now) to fail fast, rather than
-        // deferring errors to execution time. The name-based casting logic will be
-        // executed at runtime via ColumnarValue::cast_to.
         Ok(Arc::new(CastExpr::new(expr, cast_type, cast_options)))
     } else {
         not_impl_err!("Unsupported CAST from {expr_type} to {cast_type}")
