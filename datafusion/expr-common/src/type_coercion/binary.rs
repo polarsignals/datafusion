@@ -1853,8 +1853,8 @@ fn binary_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
 pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
         .or_else(|| binary_to_string_coercion(lhs_type, rhs_type))
-        .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
-        .or_else(|| ree_comparison_coercion(lhs_type, rhs_type, false))
+        .or_else(|| dictionary_comparison_coercion_generic(lhs_type, rhs_type, false, like_coercion))
+        .or_else(|| ree_comparison_coercion_generic(lhs_type, rhs_type, false, like_coercion))
         .or_else(|| regex_null_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
 }
@@ -1874,7 +1874,8 @@ fn regex_null_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataT
 /// This is a union of string coercion rules and dictionary coercion rules
 pub fn regex_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
-        .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
+        .or_else(|| dictionary_comparison_coercion_generic(lhs_type, rhs_type, false, regex_coercion))
+        .or_else(|| ree_comparison_coercion_generic(lhs_type, rhs_type, false, regex_coercion))
         .or_else(|| regex_null_coercion(lhs_type, rhs_type))
 }
 
