@@ -403,6 +403,8 @@ message ArrowType{
     Dictionary DICTIONARY = 30;
     Map MAP = 33;
     RunEndEncoded RUN_END_ENCODED = 42;
+    List LIST_VIEW = 43;
+    List LARGE_LIST_VIEW = 44;
   }
 }
 

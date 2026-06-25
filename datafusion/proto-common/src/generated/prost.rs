@@ -467,7 +467,7 @@ pub struct Decimal256 {
 pub struct ArrowType {
     #[prost(
         oneof = "arrow_type::ArrowTypeEnum",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 35, 32, 15, 34, 16, 31, 17, 18, 19, 20, 21, 22, 23, 40, 41, 24, 36, 25, 26, 27, 28, 29, 30, 33, 42"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 35, 32, 15, 34, 16, 31, 17, 18, 19, 20, 21, 22, 23, 40, 41, 24, 36, 25, 26, 27, 28, 29, 30, 33, 42, 43, 44"
     )]
     pub arrow_type_enum: ::core::option::Option<arrow_type::ArrowTypeEnum>,
 }
@@ -558,6 +558,10 @@ pub mod arrow_type {
         Map(::prost::alloc::boxed::Box<super::Map>),
         #[prost(message, tag = "42")]
         RunEndEncoded(::prost::alloc::boxed::Box<super::RunEndEncoded>),
+        #[prost(message, tag = "43")]
+        ListView(::prost::alloc::boxed::Box<super::List>),
+        #[prost(message, tag = "44")]
+        LargeListView(::prost::alloc::boxed::Box<super::List>),
     }
 }
 /// Useful for representing an empty enum variant in rust

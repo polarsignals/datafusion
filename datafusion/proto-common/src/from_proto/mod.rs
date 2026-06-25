@@ -291,6 +291,16 @@ impl TryFrom<&protobuf::arrow_type::ArrowTypeEnum> for DataType {
                     list.as_ref().field_type.as_deref().required("field_type")?;
                 DataType::LargeList(Arc::new(list_type))
             }
+            arrow_type::ArrowTypeEnum::ListView(list) => {
+                let list_type =
+                    list.as_ref().field_type.as_deref().required("field_type")?;
+                DataType::ListView(Arc::new(list_type))
+            }
+            arrow_type::ArrowTypeEnum::LargeListView(list) => {
+                let list_type =
+                    list.as_ref().field_type.as_deref().required("field_type")?;
+                DataType::LargeListView(Arc::new(list_type))
+            }
             arrow_type::ArrowTypeEnum::FixedSizeList(list) => {
                 let list_type =
                     list.as_ref().field_type.as_deref().required("field_type")?;

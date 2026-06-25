@@ -227,10 +227,13 @@ impl TryFrom<&DataType> for protobuf::arrow_type::ArrowTypeEnum {
                     values_field: Some(Box::new(values_field.as_ref().try_into()?)),
                 }))
             }
-            DataType::ListView(_) | DataType::LargeListView(_) => {
-                return Err(Error::General(format!(
-                    "Proto serialization error: {val} not yet supported"
-                )));
+            DataType::ListView(item_type) => Self::ListView(Box::new(protobuf::List {
+                field_type: Some(Box::new(item_type.as_ref().try_into()?)),
+            })),
+            DataType::LargeListView(item_type) => {
+                Self::LargeListView(Box::new(protobuf::List {
+                    field_type: Some(Box::new(item_type.as_ref().try_into()?)),
+                }))
             }
         };
 

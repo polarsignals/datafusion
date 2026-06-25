@@ -279,6 +279,12 @@ impl serde::Serialize for ArrowType {
                 arrow_type::ArrowTypeEnum::RunEndEncoded(v) => {
                     struct_ser.serialize_field("RUNENDENCODED", v)?;
                 }
+                arrow_type::ArrowTypeEnum::ListView(v) => {
+                    struct_ser.serialize_field("LISTVIEW", v)?;
+                }
+                arrow_type::ArrowTypeEnum::LargeListView(v) => {
+                    struct_ser.serialize_field("LARGELISTVIEW", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -338,6 +344,10 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
             "MAP",
             "RUN_END_ENCODED",
             "RUNENDENCODED",
+            "LIST_VIEW",
+            "LISTVIEW",
+            "LARGE_LIST_VIEW",
+            "LARGELISTVIEW",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -381,6 +391,8 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
             Dictionary,
             Map,
             RunEndEncoded,
+            ListView,
+            LargeListView,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -441,6 +453,8 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
                             "DICTIONARY" => Ok(GeneratedField::Dictionary),
                             "MAP" => Ok(GeneratedField::Map),
                             "RUNENDENCODED" | "RUN_END_ENCODED" => Ok(GeneratedField::RunEndEncoded),
+                            "LISTVIEW" | "LIST_VIEW" => Ok(GeneratedField::ListView),
+                            "LARGELISTVIEW" | "LARGE_LIST_VIEW" => Ok(GeneratedField::LargeListView),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -729,6 +743,20 @@ impl<'de> serde::Deserialize<'de> for ArrowType {
                                 return Err(serde::de::Error::duplicate_field("RUNENDENCODED"));
                             }
                             arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::RunEndEncoded)
+;
+                        }
+                        GeneratedField::ListView => {
+                            if arrow_type_enum__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("LISTVIEW"));
+                            }
+                            arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::ListView)
+;
+                        }
+                        GeneratedField::LargeListView => {
+                            if arrow_type_enum__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("LARGELISTVIEW"));
+                            }
+                            arrow_type_enum__ = map_.next_value::<::std::option::Option<_>>()?.map(arrow_type::ArrowTypeEnum::LargeListView)
 ;
                         }
                     }
