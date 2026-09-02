@@ -1082,6 +1082,8 @@ fn extract_window_frame_target_type(col_type: &DataType) -> Result<DataType> {
         Ok(DataType::Interval(IntervalUnit::MonthDayNano))
     } else if let DataType::Dictionary(_, value_type) = col_type {
         extract_window_frame_target_type(value_type)
+    } else if let DataType::RunEndEncoded(_, value_type) = col_type {
+        extract_window_frame_target_type(value_type.data_type())
     } else {
         internal_err!("Cannot run range queries on datatype: {col_type}")
     }
@@ -1102,7 +1104,22 @@ fn coerce_window_frame(
                 .map(|s| s.expr.get_type(schema))
                 .transpose()?;
             if let Some(col_type) = current_types {
-                extract_window_frame_target_type(&col_type)?
+                let target_type = extract_window_frame_target_type(&col_type)?;
+                // A finite offset bound (e.g. `5 PRECEDING`) is computed as
+                // `current_value ± offset`, so it is only meaningful for target
+                // types that support arithmetic. Other orderable target types can
+                // still use free range frames, whose bounds require comparison only.
+                // REE arrays are not supported by arrow's numeric kernesl.
+                // Tracked at https://github.com/apache/arrow-rs/issues/10891).
+                let supports_offset_arithmetic =
+                    !matches!(col_type, DataType::RunEndEncoded(_, _))
+                        && (target_type.is_numeric() || is_interval(&target_type));
+                if !supports_offset_arithmetic && !window_frame.free_range() {
+                    return plan_err!(
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for ORDER BY type {target_type}"
+                    );
+                }
+                target_type
             } else {
                 return internal_err!("ORDER BY column cannot be empty");
             }
