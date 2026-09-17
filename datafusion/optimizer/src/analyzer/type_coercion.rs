@@ -1114,7 +1114,7 @@ fn coerce_window_frame(
                 let supports_offset_arithmetic =
                     !matches!(col_type, DataType::RunEndEncoded(_, _))
                         && (target_type.is_numeric() || is_interval(&target_type));
-                if !supports_offset_arithmetic && !window_frame.free_range() {
+                if !supports_offset_arithmetic && !window_frame.can_accept_multi_orderby() {
                     return plan_err!(
                         "RANGE with offset PRECEDING/FOLLOWING is not supported for ORDER BY type {target_type}"
                     );
