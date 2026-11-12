@@ -200,3 +200,135 @@ sensor_B Utf8
 
 statement ok
 DROP TABLE ree_readings;
+
+# LIKE keeps an outer REE layer over Utf8 or dictionary-encoded Utf8.
+# A dictionary around REE or another dictionary still requires coercion.
+statement ok
+CREATE TABLE ree_strings AS
+SELECT id,
+       arrow_cast(value, 'RunEndEncoded("run_ends": non-null Int32, "values": Dictionary(UInt32, Utf8))') AS value,
+       arrow_cast(value, 'RunEndEncoded("run_ends": non-null Int32, "values": Utf8)') AS plain_value,
+       arrow_cast(arrow_cast(value, 'Dictionary(UInt32, Utf8)'),
+         'Dictionary(UInt32, RunEndEncoded("run_ends": non-null Int32, "values": Utf8))') AS dict_run,
+       arrow_cast(arrow_cast(value, 'Dictionary(UInt32, Utf8)'),
+         'Dictionary(UInt32, Dictionary(UInt32, Utf8))') AS dict_dict,
+       pattern
+FROM (VALUES
+    (1, 'Ab_c', '%b\_%'),
+    (2, 'Ab_c', 'a%'),
+    (3, 'Äpfel', 'ä%'),
+    (4, NULL, '%'),
+    (5, 'Other', NULL)
+) AS t(id, value, pattern);
+
+query IBBBBBBBB
+SELECT id, value LIKE '%b\_%', value NOT LIKE '%b\_%',
+       value ILIKE 'ä%', value NOT ILIKE 'ä%',
+       plain_value LIKE '%b\_%', plain_value NOT LIKE '%b\_%',
+       plain_value ILIKE 'ä%', plain_value NOT ILIKE 'ä%'
+FROM ree_strings ORDER BY id;
+----
+1 true false false true true false false true
+2 true false false true true false false true
+3 false true true false false true true false
+4 NULL NULL NULL NULL NULL NULL NULL NULL
+5 false true false true false true false true
+
+query TT
+EXPLAIN SELECT id FROM ree_strings WHERE value ILIKE '%b\_%';
+----
+logical_plan
+01)Projection: ree_strings.id
+02)--Filter: ree_strings.value ILIKE Utf8("%b\_%")
+03)----TableScan: ree_strings projection=[id, value]
+physical_plan
+01)FilterExec: value@1 ILIKE %b\_%, projection=[id@0]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I
+SELECT id FROM ree_strings WHERE value ILIKE '%b\_%' ORDER BY id;
+----
+1
+2
+
+query IBBBB
+SELECT id, value ILIKE pattern, plain_value ILIKE pattern,
+       dict_run ILIKE pattern, dict_dict ILIKE pattern
+FROM ree_strings ORDER BY id;
+----
+1 true true true true
+2 true true true true
+3 true true true true
+4 NULL NULL NULL NULL
+5 NULL NULL NULL NULL
+
+query TT
+EXPLAIN SELECT value ILIKE pattern, plain_value ILIKE pattern,
+               dict_run ILIKE pattern, dict_dict ILIKE pattern
+FROM ree_strings;
+----
+logical_plan
+01)Projection: ree_strings.value ILIKE ree_strings.pattern, ree_strings.plain_value ILIKE ree_strings.pattern, CAST(ree_strings.dict_run AS Utf8) ILIKE ree_strings.pattern, CAST(ree_strings.dict_dict AS Utf8) ILIKE ree_strings.pattern
+02)--TableScan: ree_strings projection=[value, plain_value, dict_run, dict_dict, pattern]
+physical_plan
+01)ProjectionExec: expr=[value@0 ILIKE pattern@4 as ree_strings.value ILIKE ree_strings.pattern, plain_value@1 ILIKE pattern@4 as ree_strings.plain_value ILIKE ree_strings.pattern, CAST(dict_run@2 AS Utf8) ILIKE pattern@4 as ree_strings.dict_run ILIKE ree_strings.pattern, CAST(dict_dict@3 AS Utf8) ILIKE pattern@4 as ree_strings.dict_dict ILIKE ree_strings.pattern]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Nested dictionaries keep their existing coercion for all four operators.
+query IBBBBBBBB
+SELECT id, dict_run LIKE '%b\_%', dict_run NOT LIKE '%b\_%',
+       dict_run ILIKE 'ä%', dict_run NOT ILIKE 'ä%',
+       dict_dict LIKE '%b\_%', dict_dict NOT LIKE '%b\_%',
+       dict_dict ILIKE 'ä%', dict_dict NOT ILIKE 'ä%'
+FROM ree_strings ORDER BY id;
+----
+1 true false false true true false false true
+2 true false false true true false false true
+3 false true true false false true true false
+4 NULL NULL NULL NULL NULL NULL NULL NULL
+5 false true false true false true false true
+
+# A different pattern layout must still coerce the REE operand's values.
+query IBB
+SELECT id, value ILIKE arrow_cast(pattern, 'LargeUtf8'),
+       value ILIKE arrow_cast(pattern, 'Utf8View')
+FROM ree_strings ORDER BY id;
+----
+1 true true
+2 true true
+3 true true
+4 NULL NULL
+5 NULL NULL
+
+query TT
+EXPLAIN SELECT value ILIKE arrow_cast('a%', 'LargeUtf8') FROM ree_strings;
+----
+logical_plan
+01)Projection: CAST(ree_strings.value AS LargeUtf8) ILIKE LargeUtf8("a%") AS ree_strings.value ILIKE arrow_cast(Utf8("a%"),Utf8("LargeUtf8"))
+02)--TableScan: ree_strings projection=[value]
+physical_plan
+01)ProjectionExec: expr=[CAST(value@0 AS LargeUtf8) ILIKE a% as ree_strings.value ILIKE arrow_cast(Utf8("a%"),Utf8("LargeUtf8"))]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# SIMILAR TO uses the regex kernel, which still needs decoded strings.
+query IB
+SELECT id, value SIMILAR TO 'Ab_c' FROM ree_strings ORDER BY id;
+----
+1 true
+2 true
+3 false
+4 NULL
+5 false
+
+query TT
+EXPLAIN SELECT value SIMILAR TO 'Ab_c' FROM ree_strings;
+----
+logical_plan
+01)Projection: CAST(ree_strings.value AS Utf8) SIMILAR TO Utf8("Ab_c")
+02)--TableScan: ree_strings projection=[value]
+physical_plan
+01)ProjectionExec: expr=[CAST(value@0 AS Utf8) ~ Ab_c as ree_strings.value SIMILAR TO Utf8("Ab_c")]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE ree_strings;
